@@ -1,4 +1,5 @@
 # StarCraft-AI
 Q-Learning and A3C
 
-under construction
+
+https://arxiv.org/pdf/1911.10635.pdf
