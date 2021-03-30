@@ -2,6 +2,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 import numpy as np
+import os.path
 
 from pysc2.lib import actions
 from pysc2.agents import base_agent
@@ -19,27 +20,37 @@ print("Using {} device".format(device))
 
 MOVE_FUNCTION_ID = 331
 
+
 class Agent(base_agent.BaseAgent):
-    def __init__(self):
+    def __init__(self, gamma=0.9, learning_rate=0.1, batch_size=64, batch_optim_steps=5, replay_memory_amount=10000,
+                 random_action_threshold=0.9, exploration_steps=3000, target_update=100, policy_update=50,
+                 path="model_weights.pt", train=True, model=DQN):
         super().__init__()
-        self.GAMMA = 0.9
-        self.BATCH_SIZE = 64
-        self.BATCH_OPTIM_STEPS = 3
-        self.OPTIM_THRESHOLD = 2000
+        self.GAMMA = gamma
+        self.LEARNING_RATE = learning_rate
+        self.BATCH_SIZE = batch_size
+        self.BATCH_OPTIM_STEPS = batch_optim_steps
         # tuples of state, action, reward, next_state
-        self.experience_replay_memory = ReplayMemory(10000)
-        self.RANDOM_ACTION_THRESHOLD = 0.9
-        self.EXPLORATION_STEPS = 1000
-        self.TARGET_UPDATE = 100
-        self.POLICY_UPDATE = 50
+        self.experience_replay_memory = ReplayMemory(replay_memory_amount)
+        self.RANDOM_ACTION_THRESHOLD = random_action_threshold
+        self.EXPLORATION_STEPS = exploration_steps
+        self.TARGET_UPDATE = target_update
+        self.POLICY_UPDATE = policy_update
+
+        self.PATH = path
+
+        self.TRAIN = train
+        self.MODEL = model
 
         self.last_action = actions.FunctionCall(actions.FUNCTIONS.no_op.id, [])
         self.last_state = 0
 
+        self.batch_loss = []
+
         self.possible_args = []
         for i in range(64):
             for j in range(64):
-                self.possible_args.append([i,j])
+                self.possible_args.append([i, j])
 
         # Network
         self.policy_net = None
@@ -49,9 +60,18 @@ class Agent(base_agent.BaseAgent):
     def setup(self, obs_spec, action_spec):
         super(Agent, self).setup(obs_spec, action_spec)
         # function 331 2 outputs => multiply output[i] * 64 for real value
-        self.policy_net = DQN(38, 64 * 64).to(device)
-        self.target_net = DQN(38, 64 * 64).to(device)
-        self.optimizer = torch.optim.RMSprop(self.policy_net.parameters(), lr=0.1)
+        self.policy_net = self.MODEL(38, 64 * 64).to(device)
+        self.target_net = self.MODEL(38, 64 * 64).to(device)
+        self.optimizer = torch.optim.RMSprop(self.policy_net.parameters(), lr=self.LEARNING_RATE)
+
+        if os.path.isfile(self.PATH):
+            if not torch.cuda.is_available():
+                self.policy_net.load_state_dict(torch.load(self.PATH, map_location=torch.device('cpu')))
+                self.target_net.load_state_dict(torch.load(self.PATH, map_location=torch.device('cpu')))
+
+            else:
+                self.policy_net.load_state_dict(torch.load(self.PATH))
+                self.target_net.load_state_dict(torch.load(self.PATH))
 
     # training loop, gathering data
     def step(self, obs):
@@ -59,30 +79,34 @@ class Agent(base_agent.BaseAgent):
         # combine features into one tensor
         screens = self.get_screens(obs.observation.feature_screen,
                                    obs.observation.feature_minimap)
+        reward = obs.reward
+        if reward >= 1:
+            reward = reward*5
+
+
         # push to replay memory when function 331 used in the last action
-        if self.steps > 10 and self.last_action.function == MOVE_FUNCTION_ID:
-            self.experience_replay_memory.push(self.last_state, self.last_action, screens,
-                                               obs.reward)
+        if self.steps > 10 and self.last_action.function == MOVE_FUNCTION_ID and self.TRAIN is True:
+            self.experience_replay_memory.push(self.last_state, self.last_action, screens,reward)
         selected_action = self.selectAction(obs)
 
         if self.steps % 100 == 0:
             print("steps: {}".format(self.steps))
+            if len(self.batch_loss) > 0:
+                print("loss: {}".format(sum(self.batch_loss) / len(self.batch_loss)))
+            torch.save(self.policy_net.state_dict(), self.PATH)
 
         self.last_action = selected_action
         self.last_state = self.get_screens(obs.observation.feature_screen,
                                            obs.observation.feature_minimap)
 
         # optimization
-        if self.steps > self.EXPLORATION_STEPS and self.steps % self.POLICY_UPDATE == 0:
-            if self.steps < self.OPTIM_THRESHOLD:
-                for i in range(self.BATCH_OPTIM_STEPS * 5):
-                    self.optimize()
-            else:
-                for i in range(self.BATCH_OPTIM_STEPS):
-                    self.optimize()
+        if self.steps > self.EXPLORATION_STEPS and self.steps % self.POLICY_UPDATE == 0 and self.TRAIN is True:
+            self.batch_loss = []
+            for i in range(self.BATCH_OPTIM_STEPS):
+                self.optimize()
 
         # update target network
-        if self.steps % self.TARGET_UPDATE == 0:
+        if self.steps % self.TARGET_UPDATE == 0 and self.TRAIN is True:
             self.target_net.load_state_dict(self.policy_net.state_dict())
 
         return selected_action
@@ -114,7 +138,7 @@ class Agent(base_agent.BaseAgent):
         batch_rewards = list()
         for i in range(len(batch.action)):
             if (len(batch.action[i].arguments)) >= 2:
-                #get index of possible_args
+                # get index of possible_args
                 batch_actions.append(torch.tensor(self.possible_args.index(batch.action[i].arguments[1])))
                 batch_rewards.append(torch.tensor(batch.reward[i]))
                 batch_states.append(batch.state[i].clone().detach())
@@ -132,7 +156,7 @@ class Agent(base_agent.BaseAgent):
         # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
         # columns of actions taken. These are the actions which would've been taken
         # for each batch state according to policy_net
-        state_action_values = self.policy_net(state_batch)
+        state_action_values = self.policy_net(state_batch.to(device))
 
         # Compute V(s_{t+1}) for all next states.
         # Expected values of actions for non_final_next_states are computed based
@@ -140,29 +164,28 @@ class Agent(base_agent.BaseAgent):
         # This is merged based on the mask, such that we'll have either the expected
         # state value or 0 in case the state was final.
         valid_batch_size = len(reward_batch)
-        next_state_values = self.target_net(non_final_next_states).max(1)[0].detach()
+        next_state_values = self.target_net(non_final_next_states.to(device)).max(1)[0].detach()
         # Compute the expected Q values
-        expected_state_action_values = (next_state_values * self.GAMMA) + reward_batch
+        expected_state_action_values = (next_state_values.to(device) * self.GAMMA) + reward_batch.to(device).float()
 
-        #add dimension for gather
+        # add dimension for gather
         batch_actions = batch_actions.unsqueeze(0)
-        state_action_values = torch.gather(state_action_values, 1, batch_actions)
+        state_action_values = torch.gather(state_action_values, 1, batch_actions.to(device))
 
         state_action_values = state_action_values.squeeze(0)
-        # print(expected_state_action_values)
-        # print(state_action_values)
+
         # Compute Huber loss
         criterion = nn.SmoothL1Loss()
         loss = criterion(state_action_values, expected_state_action_values)
-        print(loss)
 
         # Optimize the model
         self.optimizer.zero_grad()
         loss.backward()
-        #gradient clipping
+        # gradient clipping
         for param in self.policy_net.parameters():
             param.grad.data.clamp_(-1, 1)
         self.optimizer.step()
+        self.batch_loss.append(loss)
 
     def selectAction(self, obs):
         selected_action = actions.FunctionCall(actions.FUNCTIONS.no_op.id, [])
@@ -179,7 +202,7 @@ class Agent(base_agent.BaseAgent):
                 screens = self.get_screens(obs.observation.feature_screen,
                                            obs.observation.feature_minimap)
 
-                outputs = self.policy_net.forward(screens)
+                outputs = self.policy_net.forward(screens.to(device))
                 # check if function 331 is available
                 highest_q_val_index = torch.argmax(outputs.detach())
                 if MOVE_FUNCTION_ID in obs.observation.available_actions:
@@ -199,12 +222,13 @@ class Agent(base_agent.BaseAgent):
         return screens
 
     '''out_value is equal to index  '''
+
     def map_out_to_action(self, out_value):
         return self.possible_args[out_value]
 
     def pickRandomAction(self, obs):
         if MOVE_FUNCTION_ID in obs.observation.available_actions:
-            random_action_index = np.random.randint(0, 64*64)
+            random_action_index = np.random.randint(0, 64 * 64)
             args = [[0], self.map_out_to_action(random_action_index)]
             return actions.FunctionCall(MOVE_FUNCTION_ID, args)
         # gathering information using current policy

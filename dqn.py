@@ -1,4 +1,3 @@
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -7,20 +6,18 @@ class DQN(nn.Module):
     def __init__(self, channels_in, out_dim):
         super(DQN, self).__init__()
         # visual features
-        self.conv1 = nn.Conv2d(channels_in, 12, 12)
-        self.bn1 = nn.BatchNorm2d(12)
-        self.conv2 = nn.Conv2d(12, 6, 3)
+        self.conv1 = nn.Conv2d(channels_in, 18, 3)
+        self.bn1 = nn.BatchNorm2d(18)
+        self.conv2 = nn.Conv2d(18, 6, 3)
         self.bn2 = nn.BatchNorm2d(6)
 
         # predict Q-value for specific action
-        # 16 is the out channels, 12 * 12 is the downsampled image dimension
-        self.fc1 = nn.Linear(6 * 12 * 12, 256)
-        self.fc2 = nn.Linear(256, 256)
+        # 6 is the out channels, 15 * 15 is the downsampled image dimension
+        self.fc1 = nn.Linear(6 * 14 * 14, 512)
+        self.fc2 = nn.Linear(512, 256)
         self.fc3 = nn.Linear(256, out_dim)
 
     def forward(self, screens):
-        # # create batch with size 1 TODO comment out
-        # screens = screens.unsqueeze(0)
         # https://discuss.pytorch.org/t/runtimeerror-expected-scalar-type-int-but-found-float/102140
         screens = screens.float()
         conv_output = F.max_pool2d(F.relu(self.bn1(self.conv1(screens))), (2, 2))
