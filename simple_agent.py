@@ -4,7 +4,7 @@ from __future__ import print_function
 import numpy as np
 import os.path
 
-from pysc2.lib import actions
+from pysc2.lib import actions, features
 from pysc2.agents import base_agent
 
 import torch
@@ -22,46 +22,51 @@ MOVE_FUNCTION_ID = 331
 
 
 class Agent(base_agent.BaseAgent):
-    def __init__(self, gamma=0.9, learning_rate=0.1, batch_size=64, batch_optim_steps=5, replay_memory_amount=10000,
-                 random_action_threshold=0.9, exploration_steps=3000, target_update=100, policy_update=50,
-                 path="model_weights.pt", train=True, model=DQN):
+    def __init__(self, gamma=0.9, learning_rate=0.1, batch_size=64, batch_optim_steps=1, replay_memory_amount=10000,
+                 random_action_threshold=0.9, exploration_steps=3000, target_update=100, policy_update=20,
+                 path="model_weights.pt", train=True, stopping_condition=0.001):
         super().__init__()
+        # Network
+        self.PATH = path
+        self.policy_net = None
+        self.target_net = None
+        self.optimizer = None
+        self.TRAIN = train
+
+        self.batch_loss = []
+
         self.GAMMA = gamma
         self.LEARNING_RATE = learning_rate
         self.BATCH_SIZE = batch_size
         self.BATCH_OPTIM_STEPS = batch_optim_steps
-        # tuples of state, action, reward, next_state
-        self.experience_replay_memory = ReplayMemory(replay_memory_amount)
         self.RANDOM_ACTION_THRESHOLD = random_action_threshold
         self.EXPLORATION_STEPS = exploration_steps
         self.TARGET_UPDATE = target_update
         self.POLICY_UPDATE = policy_update
+        self.STOPPING_CONDITION = stopping_condition
 
-        self.PATH = path
-
-        self.TRAIN = train
-        self.MODEL = model
+        # tuples of state, action, reward, next_state
+        self.experience_replay_memory = ReplayMemory(replay_memory_amount)
 
         self.last_action = actions.FunctionCall(actions.FUNCTIONS.no_op.id, [])
         self.last_state = 0
-
-        self.batch_loss = []
 
         self.possible_args = []
         for i in range(64):
             for j in range(64):
                 self.possible_args.append([i, j])
 
-        # Network
-        self.policy_net = None
-        self.target_net = None
-        self.optimizer = None
+        self.last_episode = -1
+
+        # grid search
+        self.lastx = 0
+        self.lasty = 0
 
     def setup(self, obs_spec, action_spec):
         super(Agent, self).setup(obs_spec, action_spec)
         # function 331 2 outputs => multiply output[i] * 64 for real value
-        self.policy_net = self.MODEL(38, 64 * 64).to(device)
-        self.target_net = self.MODEL(38, 64 * 64).to(device)
+        self.policy_net = DQN(6, 64 * 64).to(device)
+        self.target_net = DQN(6, 64 * 64).to(device)
         self.optimizer = torch.optim.RMSprop(self.policy_net.parameters(), lr=self.LEARNING_RATE)
 
         if os.path.isfile(self.PATH):
@@ -77,27 +82,32 @@ class Agent(base_agent.BaseAgent):
     def step(self, obs):
         super(Agent, self).step(obs)
         # combine features into one tensor
-        screens = self.get_screens(obs.observation.feature_screen,
-                                   obs.observation.feature_minimap)
+        # screens = self.get_screens(obs.observation.feature_screen,
+        #                            obs.observation.feature_minimap)
+        screens = self.get_screens(obs.observation.rgb_screen,
+                                   obs.observation.rgb_minimap)
         reward = obs.reward
         if reward >= 1:
-            reward = reward*5
-
+            reward = reward * 5
 
         # push to replay memory when function 331 used in the last action
         if self.steps > 10 and self.last_action.function == MOVE_FUNCTION_ID and self.TRAIN is True:
-            self.experience_replay_memory.push(self.last_state, self.last_action, screens,reward)
-        selected_action = self.selectAction(obs)
+            self.experience_replay_memory.push(self.last_state, self.last_action, screens, reward)
+        selected_action = self.selectAction(obs, screens)
 
         if self.steps % 100 == 0:
             print("steps: {}".format(self.steps))
+            torch.save(self.policy_net.state_dict(), self.PATH)
             if len(self.batch_loss) > 0:
                 print("loss: {}".format(sum(self.batch_loss) / len(self.batch_loss)))
-            torch.save(self.policy_net.state_dict(), self.PATH)
+                if sum(self.batch_loss) / len(self.batch_loss) < self.STOPPING_CONDITION:
+                    print("stop condition")
+                    self.steps = 99999999999999999
+                    return None
+
 
         self.last_action = selected_action
-        self.last_state = self.get_screens(obs.observation.feature_screen,
-                                           obs.observation.feature_minimap)
+        self.last_state = screens
 
         # optimization
         if self.steps > self.EXPLORATION_STEPS and self.steps % self.POLICY_UPDATE == 0 and self.TRAIN is True:
@@ -166,7 +176,7 @@ class Agent(base_agent.BaseAgent):
         valid_batch_size = len(reward_batch)
         next_state_values = self.target_net(non_final_next_states.to(device)).max(1)[0].detach()
         # Compute the expected Q values
-        expected_state_action_values = (next_state_values.to(device) * self.GAMMA) + reward_batch.to(device).float()
+        expected_state_action_values = reward_batch.to(device).float() + (next_state_values.to(device) * self.GAMMA)
 
         # add dimension for gather
         batch_actions = batch_actions.unsqueeze(0)
@@ -187,21 +197,19 @@ class Agent(base_agent.BaseAgent):
         self.optimizer.step()
         self.batch_loss.append(loss)
 
-    def selectAction(self, obs):
+    def selectAction(self, obs, screens):
         selected_action = actions.FunctionCall(actions.FUNCTIONS.no_op.id, [])
 
         # exploration phase
-        if self.steps < self.EXPLORATION_STEPS:
+        if self.steps < self.EXPLORATION_STEPS and self.TRAIN is True:
             return self.pickRandomAction(obs)
+            # return self.gridSearch(obs)
 
         # pick random action / noise
         if np.random.random() >= self.RANDOM_ACTION_THRESHOLD:
             selected_action = self.pickRandomAction(obs)
         else:
             with torch.no_grad():
-                screens = self.get_screens(obs.observation.feature_screen,
-                                           obs.observation.feature_minimap)
-
                 outputs = self.policy_net.forward(screens.to(device))
                 # check if function 331 is available
                 highest_q_val_index = torch.argmax(outputs.detach())
@@ -210,12 +218,23 @@ class Agent(base_agent.BaseAgent):
                     args = [[0], self.map_out_to_action(highest_q_val_index)]
                     selected_action = actions.FunctionCall(MOVE_FUNCTION_ID, args)
 
+        # select the army unit at the start of each new episode:
+        if self.episodes > self.last_episode:
+            self.last_episode += 1
+            return actions.FunctionCall(function=7, arguments=[[1]])
+
         return selected_action
 
+    # TODO change so less screens
     def get_screens(self, feature_screen, feature_minimap):
         # shift dimensions => (channel, y, x)
-        feature_screen = torch.tensor(feature_screen).permute(0, 2, 1)
-        feature_minimap = torch.tensor(feature_minimap).permute(0, 2, 1)
+        # IF FEATURE SCREEN
+        # feature_screen = torch.tensor(feature_screen).permute(0, 2, 1)
+        # feature_minimap = torch.tensor(feature_minimap).permute(0, 2, 1)
+
+        feature_screen = torch.tensor(feature_screen).permute(2, 1, 0)
+        feature_minimap = torch.tensor(feature_minimap).permute(2, 1, 0)
+
         # concat screens to one tensor
         screens = torch.cat((feature_screen, feature_minimap), 0)
         screens = screens.unsqueeze(0)
@@ -231,8 +250,34 @@ class Agent(base_agent.BaseAgent):
             random_action_index = np.random.randint(0, 64 * 64)
             args = [[0], self.map_out_to_action(random_action_index)]
             return actions.FunctionCall(MOVE_FUNCTION_ID, args)
-        # gathering information using current policy
+
+        # random action
         function_id = np.random.choice(obs.observation.available_actions)
         args = [[np.random.randint(0, size) for size in arg.sizes]
                 for arg in self.action_spec.functions[function_id].args]
+        return actions.FunctionCall(function_id, args)
+
+    def gridSearch(self, obs):
+        if MOVE_FUNCTION_ID in obs.observation.available_actions:
+            # grid search
+            if self.lasty < 63:
+                if self.lastx < 63:
+                    self.lastx += 1
+                else:
+                    self.lastx = 0
+                    if self.lasty + 3 < 63:
+                        self.lasty += 3
+            # reset search
+            else:
+                self.lasty = 0
+                self.lastx = 0
+
+            args = [[0], [self.lastx, self.lasty]]
+            return actions.FunctionCall(MOVE_FUNCTION_ID, args)
+
+        # random action
+        function_id = np.random.choice(obs.observation.available_actions)
+        args = [[np.random.randint(0, size) for size in arg.sizes]
+                for arg in self.action_spec.functions[function_id].args]
+
         return actions.FunctionCall(function_id, args)
