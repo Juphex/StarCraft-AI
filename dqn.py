@@ -3,43 +3,30 @@ import torch.nn.functional as F
 
 
 class DQN(nn.Module):
-    def __init__(self, channels_in, out_dim):
+
+    def __init__(self, h, w, in_channel, outputs):
         super(DQN, self).__init__()
-        # visual features
-        # channels x dim_x, dim_y
-        self.conv1 = nn.Conv2d(channels_in, 3, 3)
-        self.bn1 = nn.BatchNorm2d(3)
-        # 2x2 kernel ==
-        # self.conv2 = nn.Conv2d(3, 3, 3)
-        # self.bn2 = nn.BatchNorm2d(3)
-        # self.conv3 = nn.Conv2d(12, 4, 3)
-        # self.bn3 = nn.BatchNorm2d(4)
+        self.conv1 = nn.Conv2d(in_channel, 16, kernel_size=4, stride=2)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=4, stride=2)
+        self.bn2 = nn.BatchNorm2d(32)
+        # self.conv3 = nn.Conv2d(32, 46, kernel_size=4, stride=2)
+        # self.bn3 = nn.BatchNorm2d(46)
 
-        # dropout, important during small size of gathered Transitions containing a reward
-        self.dropout = nn.Dropout(p=0.01, inplace=False)
+        # Number of Linear input connections depends on output of conv2d layers
+        # and therefore the input image size, so compute it.
+        def conv2d_size_out(size, kernel_size=4, stride=2):
+            return (size - (kernel_size - 1) - 1) // stride + 1
 
-        # predict Q-value for specific action
-        # (in_channel, dim_x, dim_y) where dim_x and dim_y are downsampled
-        self.fc1 = nn.Linear(3 * 31 * 31, 512)
-        # self.fc2 = nn.Linear(512, 256)
-        self.fc3 = nn.Linear(512, out_dim)
+        convw = conv2d_size_out(conv2d_size_out(w))
+        convh = conv2d_size_out(conv2d_size_out(h))
+        linear_input_size = convw * convh * 32
+        self.head = nn.Linear(linear_input_size, outputs)
 
-    def forward(self, screens):
-        # https://discuss.pytorch.org/t/runtimeerror-expected-scalar-type-int-but-found-float/102140
-        screens = screens.float()
-        conv_output = F.max_pool2d(F.relu(self.bn1(self.conv1(screens))), (2, 2))
-        # conv_output = F.max_pool2d(F.relu(self.bn2(self.conv2(conv_output))), (2, 2))
-        # conv_output = F.relu(self.bn3(self.conv3(conv_output))), (2, 2)
-        conv_output = conv_output.view(-1, self.num_flat_features(conv_output))
-        x = F.relu(self.fc1(conv_output))
-        # x = F.relu(self.fc2(x))
-        # x = self.dropout(x)
-        pred_action = F.relu(self.fc3(x))
-        return pred_action
-
-    def num_flat_features(self, x):
-        size = x.size()[1:]  # all dimensions except the batch dimension
-        num_features = 1
-        for s in size:
-            num_features *= s
-        return num_features
+    # Called with either one element to determine next action, or a batch
+    # during optimization. Returns tensor([[left0exp,right0exp]...]).
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x.float())))
+        x = F.relu(self.bn2(self.conv2(x)))
+        # x = F.relu(self.bn3(self.conv3(x)))
+        return self.head(x.view(x.size(0), -1))
