@@ -22,11 +22,12 @@ FLAGS = flags.FLAGS
 
 # flags info: https://github.com/deepmind/pysc2/blob/master/pysc2/bin/agent.py
 flags.DEFINE_string("map", "MoveToBeacon", "Name of a map to use.")
+#flags.DEFINE_string("map", "CollectMineralShards", "Name of a map to use.")
 flags.DEFINE_integer("max_agent_steps", 0, "Total agent steps.")
 flags.DEFINE_integer("game_steps_per_episode", None, "Game steps per episode.")
 flags.DEFINE_integer("max_episodes", 0, "Total episodes.")
 # 2,5e-11, 2,5e-10, 2,5e-9, 2,5e-8, 2,5e-7 2,5e-6 2,5e-5, 2,5e-4
-flags.DEFINE_float("learning_rate", 2.5e-6, "Learning rate.")
+flags.DEFINE_float("learning_rate", 2e-05, "Learning rate.")
 flags.DEFINE_string("path", "model_weights.pt", "Path and filename of the network weights to be loaded and saved.")
 
 
@@ -58,7 +59,7 @@ def main(argv):
                   replay_memory_amount=10000, gamma=0.99, learning_rate=lr,
                   epsilon=0.6, path=path, score_multiplier=score_multiplier)]
         env = available_actions_printer.AvailableActionsPrinter(env)
-        run_loop.run_loop(agents, env, max_episodes=20000)
+        run_loop.run_loop(agents, env, max_episodes=1000)
 
         plt.ioff()
         plt.show()
